@@ -1,0 +1,19 @@
+name: Smoke
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: p6m7g8-actions/checkout@main
+
+      - name: Run local ai-adjudicator action
+        uses: ./
+        with:
+          gh_token: ${{ secrets.P6_A_GH_TOKEN }}
+          comment_on_iterate: 'false'
+          approve_on_accept: 'false'
+          enqueue_on_accept: 'false'

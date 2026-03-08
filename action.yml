@@ -1,0 +1,273 @@
+name: "P6 GHA: AI Adjudicator"
+description: "Adjudicate Codex and Claude PR reviews, resolve threads, approve, and enqueue"
+author: "Philip M. Gollucci"
+
+inputs:
+  gh_token:
+    description: "GitHub token with pull-request write permissions"
+    required: true
+  repo:
+    description: "Owner/repo"
+    required: false
+    default: ${{ github.repository }}
+  pr_number:
+    description: "PR number to adjudicate; auto-detected if empty"
+    required: false
+    default: ""
+  required_checks_csv:
+    description: "Comma-delimited required check names"
+    required: false
+    default: "build,Lint PR title,claude-review,codex-review"
+  codex_prefix:
+    description: "Codex review comment prefix"
+    required: false
+    default: "Codex Autonomous Review:"
+  claude_prefix:
+    description: "Claude review comment prefix"
+    required: false
+    default: "Claude Autonomous Review:"
+  iterate_comment:
+    description: "Comment to post when verdict is iterate"
+    required: false
+    default: "Autonomous adjudicator: no Codex/Claude consensus yet. Waiting for next pull_request synchronize change."
+  comment_on_iterate:
+    description: "Post iterate comment when verdict=iterate"
+    required: false
+    default: "true"
+  approve_on_accept:
+    description: "Submit approving review when verdict=accept and final guard passes"
+    required: false
+    default: "true"
+  enqueue_on_accept:
+    description: "Enable auto-merge enqueue on accept and final guard pass"
+    required: false
+    default: "true"
+
+outputs:
+  pr_number:
+    description: "Adjudicated PR number"
+    value: ${{ steps.select_pr.outputs.pr_number }}
+  proceed:
+    description: "Whether all required checks are green and PR can be adjudicated"
+    value: ${{ steps.gate.outputs.proceed }}
+  verdict:
+    description: "accept|iterate|skip"
+    value: ${{ steps.ai_out.outputs.verdict }}
+  resolved_threads:
+    description: "Count of resolved threads"
+    value: ${{ steps.resolve.outputs.count || '0' }}
+  review_decision:
+    description: "GitHub reviewDecision at final guard"
+    value: ${{ steps.final_guard.outputs.review_decision || '' }}
+  final_guard_ok:
+    description: "true when approval/enqueue is allowed"
+    value: ${{ steps.final_guard.outputs.ok || 'false' }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Select PR
+      id: select_pr
+      shell: bash
+      env:
+        IN_PR_NUMBER: ${{ inputs.pr_number }}
+      run: |
+        set -euo pipefail
+        pr_number="$IN_PR_NUMBER"
+        if [ -z "$pr_number" ]; then
+          pr_number="${{ github.event.pull_request.number || '' }}"
+        fi
+        if [ -z "$pr_number" ]; then
+          pr_number="$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")"
+        fi
+        echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+    - name: Gate on PR state and required checks
+      id: gate
+      if: steps.select_pr.outputs.pr_number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+        REQUIRED_CHECKS_CSV: ${{ inputs.required_checks_csv }}
+      run: |
+        set -euo pipefail
+
+        state=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json state --jq '.state')
+        draft=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json isDraft --jq '.isDraft')
+        head_sha=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+
+        if [ "$state" != "OPEN" ] || [ "$draft" = "true" ]; then
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        checks_json=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/commits/$head_sha/check-runs?per_page=100")
+        IFS=',' read -r -a required <<< "$REQUIRED_CHECKS_CSV"
+
+        for name in "${required[@]}"; do
+          name="$(echo "$name" | sed 's/^ *//; s/ *$//')"
+          [ -z "$name" ] && continue
+          count=$(echo "$checks_json" | jq --arg n "$name" '[.check_runs[] | select(.name == $n)] | length')
+          if [ "$count" -eq 0 ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status=$(echo "$checks_json" | jq -r --arg n "$name" '[.check_runs[] | select(.name == $n)] | sort_by(.started_at) | last | .status')
+          conclusion=$(echo "$checks_json" | jq -r --arg n "$name" '[.check_runs[] | select(.name == $n)] | sort_by(.started_at) | last | .conclusion')
+          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+        done
+
+        echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+    - name: AI adjudication
+      id: ai
+      if: steps.select_pr.outputs.pr_number == '' || steps.gate.outputs.proceed != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "verdict=skip" >> "$GITHUB_OUTPUT"
+
+    - name: AI adjudication
+      id: ai_run
+      if: steps.gate.outputs.proceed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+        CODEX_PREFIX: ${{ inputs.codex_prefix }}
+        CLAUDE_PREFIX: ${{ inputs.claude_prefix }}
+      run: |
+        set -euo pipefail
+
+        codex_body=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '[.comments[] | select((.author.login | startswith("github-actions")) or (.author.login == "p6m7g8-automation")) | .body | select(startswith(env.CODEX_PREFIX))] | last // ""')
+        claude_body=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '[.comments[] | select((.author.login | startswith("github-actions")) or (.author.login | startswith("claude")) or (.author.login == "p6m7g8-automation")) | .body | select((startswith(env.CLAUDE_PREFIX)) or (contains("Code Review Complete"))) ] | last // ""')
+
+        if [ -z "$codex_body" ] || [ -z "$claude_body" ]; then
+          echo "verdict=iterate" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        codex_incorrect=$(printf '%s' "$codex_body" | grep -Eic 'Overall:\s*patch is incorrect' || true)
+        claude_incorrect=$(printf '%s' "$claude_body" | grep -Eic 'Overall:\s*patch is incorrect|🚨\s*\*\*Bug\*\*|\[P1\]' || true)
+        codex_correct=$(printf '%s' "$codex_body" | grep -Eic 'Overall:\s*patch is correct' || true)
+        claude_correct=$(printf '%s' "$claude_body" | grep -Eic 'Overall:\s*patch is correct|Code Review Complete' || true)
+        codex_findings=$(printf '%s' "$codex_body" | sed -nE 's/.*Findings \(total\):[[:space:]]*([0-9]+).*/\1/p' | tail -n1)
+        if [ -z "$codex_findings" ]; then
+          codex_findings=999
+        fi
+
+        if [ "$codex_incorrect" -gt 0 ] || [ "$claude_incorrect" -gt 0 ]; then
+          if [ "$codex_incorrect" -gt 0 ] && [ "$codex_findings" -eq 0 ] && [ "$claude_correct" -gt 0 ] && [ "$claude_incorrect" -eq 0 ]; then
+            echo "verdict=accept" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "verdict=iterate" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$codex_correct" -gt 0 ] && [ "$claude_correct" -gt 0 ]; then
+          echo "verdict=accept" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "verdict=iterate" >> "$GITHUB_OUTPUT"
+
+    - name: Export verdict
+      id: ai_out
+      shell: bash
+      env:
+        V1: ${{ steps.ai.outputs.verdict }}
+        V2: ${{ steps.ai_run.outputs.verdict }}
+      run: |
+        set -euo pipefail
+        verdict="$V1"
+        if [ -n "$V2" ]; then
+          verdict="$V2"
+        fi
+        [ -z "$verdict" ] && verdict="skip"
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+    - name: Iterate comment
+      if: steps.ai_out.outputs.verdict == 'iterate' && inputs.comment_on_iterate == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+        ITERATE_COMMENT: ${{ inputs.iterate_comment }}
+      run: |
+        set -euo pipefail
+        gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$ITERATE_COMMENT"
+
+    - name: Resolve all unresolved review threads
+      id: resolve
+      if: steps.ai_out.outputs.verdict == 'accept'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+      run: |
+        set -euo pipefail
+        owner="${REPO%%/*}"
+        repo="${REPO##*/}"
+
+        query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved}}}}}'
+        threads=$(gh api graphql -f query="$query" -F owner="$owner" -F repo="$repo" -F number="$PR_NUMBER" --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .id' || true)
+
+        count=0
+        while IFS= read -r tid; do
+          [ -z "$tid" ] && continue
+          mutation='mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}'
+          gh api graphql -f query="$mutation" -F threadId="$tid" >/dev/null
+          count=$((count + 1))
+        done <<< "$threads"
+
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+        gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Autonomous adjudicator: resolved $count unresolved review thread(s)."
+
+    - name: Final guard
+      id: final_guard
+      if: steps.ai_out.outputs.verdict == 'accept'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+      run: |
+        set -euo pipefail
+        decision=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json reviewDecision --jq '.reviewDecision')
+        echo "review_decision=$decision" >> "$GITHUB_OUTPUT"
+        if [ "$decision" = "CHANGES_REQUESTED" ]; then
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "ok=true" >> "$GITHUB_OUTPUT"
+
+    - name: Approve PR
+      if: steps.ai_out.outputs.verdict == 'accept' && steps.final_guard.outputs.ok == 'true' && inputs.approve_on_accept == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+      run: |
+        set -euo pipefail
+        gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body "Autonomous approval: Codex and Claude both accepted."
+
+    - name: Enqueue PR
+      if: steps.ai_out.outputs.verdict == 'accept' && steps.final_guard.outputs.ok == 'true' && inputs.enqueue_on_accept == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        REPO: ${{ inputs.repo }}
+        PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+      run: |
+        set -euo pipefail
+        gh pr merge --auto --squash -R "$REPO" "$PR_NUMBER"
