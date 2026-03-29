@@ -2,20 +2,21 @@ name: auto-approve
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, edited]
-  workflow_run:
-    workflows: ["Build", "Claude Code Review", "Codex Code Review"]
-    types: [completed]
+    types:
+      - labeled
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
 
 jobs:
-  adjudicate:
+  approve:
     runs-on: ubuntu-latest
+    name: Auto-Approve PR
     permissions:
-      contents: read
-      issues: write
       pull-requests: write
     steps:
-      - name: AI adjudicator
-        uses: p6m7g8-actions/ai-adjudicator@main
+      - name: Auto-Approve PR
+        uses: p6m7g8-actions/p6-gh-pr-auto-approve@main
         with:
-          gh_token: ${{ secrets.P6_A_GH_TOKEN }}
+          bot_token: ${{ secrets.P6_A_GH_TOKEN }}
