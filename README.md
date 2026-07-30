@@ -35,6 +35,10 @@ jobs:
 - `required_checks_csv`: required check names, default `build,Lint PR title,claude-review,codex-review`.
 - `codex_prefix`: codex comment prefix, default `Codex Autonomous Review:`.
 - `claude_prefix`: claude comment prefix, default `Claude Autonomous Review:`.
+- `allowed_bot_logins`: comma-delimited exact bot logins whose review comments count as verdicts,
+  default `claude[bot],github-actions[bot],p6m7g8-automation`. Author login must match a list entry
+  exactly; a matching comment body from any other author is ignored. `claude[bot]` is the login the
+  Claude review action posts under, so removing it makes every verdict fail closed.
 - `iterate_comment`: comment body when verdict is iterate.
 - `comment_on_iterate`: `true|false`, default `true`.
 - `approve_on_accept`: `true|false`, default `true`.
