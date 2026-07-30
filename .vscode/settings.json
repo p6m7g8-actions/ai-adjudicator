@@ -32,7 +32,9 @@
   },
   "cSpell.words": [
     "Gollucci",
-    "karancode"
+    "karancode",
+    "metacharacter",
+    "unparseable"
   ],
   "[yaml]": {
     "editor.defaultFormatter": "redhat.vscode-yaml"
