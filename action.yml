@@ -26,6 +26,10 @@ inputs:
     description: "Claude review comment prefix"
     required: false
     default: "Claude Autonomous Review:"
+  allowed_bot_logins:
+    description: "Comma-delimited exact bot logins whose review comments count as verdicts"
+    required: false
+    default: "claude[bot],github-actions[bot],p6m7g8-automation"
   iterate_comment:
     description: "Comment to post when verdict is iterate"
     required: false
@@ -142,11 +146,22 @@ runs:
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
         CODEX_PREFIX: ${{ inputs.codex_prefix }}
         CLAUDE_PREFIX: ${{ inputs.claude_prefix }}
+        ALLOWED_BOT_LOGINS: ${{ inputs.allowed_bot_logins }}
       run: |
         set -euo pipefail
 
-        codex_body=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '[.comments[] | select((.author.login | startswith("github-actions")) or (.author.login == "p6m7g8-automation")) | .body | select(startswith(env.CODEX_PREFIX))] | last // ""')
-        claude_body=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '[.comments[] | select((.author.login | startswith("github-actions")) or (.author.login | startswith("claude")) or (.author.login == "p6m7g8-automation")) | .body | select((startswith(env.CLAUDE_PREFIX)) or (contains("Code Review Complete"))) ] | last // ""')
+        # A comment counts as a verdict only when its author login is an exact
+        # member of ALLOWED_BOT_LOGINS. Body text alone never qualifies, so a
+        # third party cannot forge a verdict on a public repository.
+        allowed_logins="$(printf '%s' "$ALLOWED_BOT_LOGINS" | tr -d '[:space:]')"
+        comments_json="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json comments)"
+
+        author_gate='($allowed | split(",") | map(select(length > 0))) as $logins | [ .comments[] | select(.author.login as $login | $logins | any(. == $login)) | .body ]'
+        codex_filter="$author_gate"' | map(select(startswith($prefix))) | last // ""'
+        claude_filter="$author_gate"' | map(select(startswith($prefix) or contains("Code Review Complete"))) | last // ""'
+
+        codex_body=$(jq -r --arg allowed "$allowed_logins" --arg prefix "$CODEX_PREFIX" "$codex_filter" <<< "$comments_json")
+        claude_body=$(jq -r --arg allowed "$allowed_logins" --arg prefix "$CLAUDE_PREFIX" "$claude_filter" <<< "$comments_json")
 
         if [ -z "$codex_body" ] || [ -z "$claude_body" ]; then
           echo "verdict=iterate" >> "$GITHUB_OUTPUT"
