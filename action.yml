@@ -27,7 +27,11 @@ inputs:
     required: false
     default: "code"
   allowed_bot_logins:
-    description: "Comma-delimited exact bot logins whose review comments count as verdicts"
+    description: >-
+      Comma-delimited exact bot logins whose pull request CONVERSATION comments
+      count as verdicts. Formal review bodies and inline review comments are not
+      read at all, so an allowlisted identity that posts approving reviews rather
+      than conversation comments can never supply a verdict.
     required: false
     default: "claude[bot],github-actions[bot],p6m7g8-automation"
   iterate_comment:
@@ -81,6 +85,17 @@ outputs:
 runs:
   using: "composite"
   steps:
+    # Single definition of the marker this action stamps on every comment it
+    # posts. The parser skips any comment carrying it, so the adjudicator can
+    # never read its own output back as a verdict, and re-running it on an
+    # already-adjudicated PR stays idempotent.
+    - name: Constants
+      id: consts
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo 'self_marker=<!-- p6-adjudicator -->' >> "$GITHUB_OUTPUT"
+
     - name: Select PR
       id: select_pr
       shell: bash
@@ -138,9 +153,23 @@ runs:
           fi
         done
 
-        echo "proceed=true" >> "$GITHUB_OUTPUT"
+        # Freshness cutoff for verdict comments: the earliest moment any check
+        # run started on the head SHA, which is necessarily after the push that
+        # created it. A verdict comment about an earlier push was last written
+        # during that push's checks, so it cannot fall at or after this cutoff.
+        # This is what stops a stale pass from being read as a pass for new
+        # code. A green check on the head SHA does not imply a fresh comment:
+        # the distributed claude-review.yml runs the review with
+        # continue-on-error, so the check goes green even when the review
+        # produced nothing at all.
+        verdict_after=$(echo "$checks_json" | jq -r '[.check_runs[].started_at // empty] | sort | first // ""')
 
-    - name: AI adjudication
+        {
+          echo "verdict_after=$verdict_after"
+          echo "proceed=true"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: AI adjudication (nothing to adjudicate)
       id: ai
       if: steps.select_pr.outputs.pr_number == '' || steps.gate.outputs.proceed != 'true'
       shell: bash
@@ -148,7 +177,7 @@ runs:
         set -euo pipefail
         echo "verdict=skip" >> "$GITHUB_OUTPUT"
 
-    - name: AI adjudication
+    - name: AI adjudication (parse lane verdicts)
       id: ai_run
       if: steps.gate.outputs.proceed == 'true'
       shell: bash
@@ -158,22 +187,34 @@ runs:
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
         REQUIRED_LANES_CSV: ${{ inputs.required_lanes_csv }}
         ALLOWED_BOT_LOGINS: ${{ inputs.allowed_bot_logins }}
+        VERDICT_AFTER: ${{ steps.gate.outputs.verdict_after }}
+        SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
       run: |
         set -euo pipefail
 
-        # Verdict contract, produced by p6m7g8-actions/claude:
+        # Verdict contract, produced by p6m7g8-actions/claude. The LAST THREE
+        # NON-EMPTY LINES of the comment, in this order and nothing after them:
         #
         #   Review-Lane: code
         #   Overall: patch is correct
         #   Findings (total): 0
         #
-        # Those three lines are the LAST lines of the comment, because
-        # claude-code-action with track_progress writes its own
-        # "Claude finished ... in Xm Ys" header first. So the match anchors on
-        # the lines themselves and never on the first line, and no leading
-        # comment prefix is required. "Overall: patch is incorrect" is the
-        # negative form. There is one voice now that Codex is retired, so there
-        # is nothing to reconcile: every required lane must say correct.
+        # They are at the end, not the start, because claude-code-action with
+        # track_progress writes its own "Claude finished ... in Xm Ys" header
+        # first, so the start of the comment is not the producer's to control.
+        # Nothing anchors on the first line and no leading prefix is required.
+        # "Overall: patch is incorrect" is the negative form. There is one voice
+        # now that Codex is retired, so there is nothing to reconcile: every
+        # required lane must say correct.
+        #
+        # Matching is positional on those last three lines and never a scan of
+        # the whole body. Scanning was a fail-open: a review that merely QUOTES
+        # the contract while discussing it emitted a parseable verdict, and this
+        # action's own fail-loud comment used to reproduce the contract, so run
+        # N would report a broken producer and run N+1 would read its own
+        # comment back as a pass and auto-merge. Three independent guards now
+        # close that: positional matching, the self-marker below, and a loud
+        # comment that describes the lines instead of reproducing them.
         #
         # Comments are read over REST, not `gh pr view --json comments`. The
         # GraphQL shape gh uses renders a GitHub App author with the "[bot]"
@@ -182,6 +223,11 @@ runs:
         # "claude[bot]" form, which no user account can hold because "[" is not
         # a legal login character, so exact-match allowlisting is only sound
         # over REST.
+        #
+        # Only pull request conversation comments are read. Formal review bodies
+        # (/pulls/{n}/reviews) and inline review comments are deliberately out
+        # of scope: the producer posts to the conversation, and an allowlisted
+        # identity's approving review is an approval, not a verdict.
         comments_json="$(gh api --paginate -H "Accept: application/vnd.github+json" \
           "/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" | jq -s 'add // []')"
 
@@ -192,38 +238,53 @@ runs:
         # read as a metacharacter.
         verdict_program='
         def trim: gsub("^\\s+|\\s+$"; "");
-        def norm_lines: split("\n") | map(gsub("\r"; "") | trim);
+        def clean: gsub("`"; "");
+        def tail3: split("\n") | map(gsub("\r"; "") | trim) | map(select(length > 0)) | (["", "", ""] + .) | .[-3:];
+        def lanes_named: [ .[] | select(startswith("Review-Lane:")) | ltrimstr("Review-Lane:") | trim ];
         ($allowed | split(",") | map(trim) | map(select(length > 0))) as $logins
         | ($lanes | split(",") | map(trim) | map(select(length > 0))) as $required
         | [ .[]
             | select(((.user.login // "") | . as $login | $logins | index($login)))
-            | .body // ""
-          ] as $bodies
+            | select(((.body // "") | contains($marker)) | not)
+            | { author: (.user.login // ""),
+                at: (.updated_at // .created_at // ""),
+                tail: ((.body // "") | tail3) }
+            | select(($after | length) == 0 or (.at >= $after))
+          ] | sort_by(.at) as $candidates
         | $required[] as $lane
-        | [ $bodies[]
-            | select(
-                [ norm_lines[]
-                  | select(startswith("Review-Lane:"))
-                  | ltrimstr("Review-Lane:")
-                  | trim
-                ] | index($lane)
-              )
-          ] as $matches
-        | if ($matches | length) == 0
+        | [ $candidates[] | select(.tail | lanes_named | index($lane)) ] as $attempts
+        | if ($attempts | length) == 0
           then [$lane, "missing", "", ""]
           else
-            ($matches | last | norm_lines) as $l
-            | ([ $l[] | select(startswith("Overall:")) | ltrimstr("Overall:") | trim ] | last) as $overall
-            | ([ $l[] | select(startswith("Findings (total):")) | ltrimstr("Findings (total):") | trim ] | last) as $findings
-            | if $overall == null
-              then [$lane, "unparseable", "", "no `Overall:` line"]
-              elif ($overall | test("^patch is (correct|incorrect)$") | not)
-              then [$lane, "unparseable", "", "malformed `Overall:` line: `Overall: " + $overall + "`"]
-              elif $findings == null
-              then [$lane, "unparseable", "", "no `Findings (total):` line"]
-              elif ($findings | test("^[0-9]+$") | not)
-              then [$lane, "unparseable", "", "malformed `Findings (total):` line: `Findings (total): " + $findings + "`"]
-              else [$lane, (if $overall == "patch is correct" then "correct" else "incorrect" end), $findings, ""]
+            ($attempts | last) as $chosen
+            | [ $candidates[]
+                | select(.at > $chosen.at and .author == $chosen.author)
+                | select((.tail | map(select(startswith("Review-Lane:"))) | length) == 0)
+              ] as $superseding
+            | if ($superseding | length) > 0
+              then [$lane, "missing", "", ""]
+              else
+                $chosen.tail as $t
+                | ($t[0] | ltrimstr("Review-Lane:") | trim) as $tlane
+                | ($t[1] | ltrimstr("Overall:") | trim) as $overall
+                | ($t[2] | ltrimstr("Findings (total):") | trim) as $findings
+                | (($t[0] | startswith("Review-Lane:")) and $tlane == $lane) as $p0
+                | ($t[1] | startswith("Overall:")) as $p1
+                | ($t[2] | startswith("Findings (total):")) as $p2
+                | if $p0 and $p1 and $p2
+                     and ($overall | test("^patch is (correct|incorrect)$"))
+                     and ($findings | test("^[0-9]+$"))
+                  then [$lane, (if $overall == "patch is correct" then "correct" else "incorrect" end), $findings, ""]
+                  elif ($t | map(select(startswith("Overall:"))) | length) == 0
+                  then [$lane, "unparseable", "", "no `Overall:` line in the last three lines"]
+                  elif ($t | map(select(startswith("Findings (total):"))) | length) == 0
+                  then [$lane, "unparseable", "", "no `Findings (total):` line in the last three lines"]
+                  elif (($p0 and $p1 and $p2) | not)
+                  then [$lane, "unparseable", "", "contract lines are present but are not the last three lines, in order"]
+                  elif ($overall | test("^patch is (correct|incorrect)$") | not)
+                  then [$lane, "unparseable", "", "malformed `Overall:` value: " + ($overall | clean | @json)]
+                  else [$lane, "unparseable", "", "malformed `Findings (total):` value: " + ($findings | clean | @json)]
+                  end
               end
           end
         | @tsv'
@@ -231,6 +292,8 @@ runs:
         records="$(jq -r \
           --arg allowed "$ALLOWED_BOT_LOGINS" \
           --arg lanes "$REQUIRED_LANES_CSV" \
+          --arg after "$VERDICT_AFTER" \
+          --arg marker "$SELF_MARKER" \
           "$verdict_program" <<< "$comments_json")"
 
         accept="true"
@@ -268,7 +331,10 @@ runs:
               # bounded fix loop before anyone looked at the run.
               accept="false"
               unparseable_lanes="${unparseable_lanes:+$unparseable_lanes,}$lane"
-              report="${report}- lane \`$lane\`: $detail"$'\n'
+              # Double quotes, not a backticked span: the detail can carry text
+              # lifted out of a comment, and an unbalanced backtick would
+              # otherwise swallow the rest of the line as a code span.
+              report="${report}- lane \"$lane\": $detail"$'\n'
               echo "::error title=Unparseable AI verdict::lane '$lane': $detail"
               ;;
           esac
@@ -322,20 +388,32 @@ runs:
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
         UNPARSEABLE_LANES: ${{ steps.ai_run.outputs.unparseable_lanes }}
         UNPARSEABLE_REPORT: ${{ steps.ai_run.outputs.unparseable_report }}
+        SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
       run: |
         set -euo pipefail
+
+        # This comment DESCRIBES the contract lines; it must never reproduce
+        # them. An earlier version printed them indented four spaces to render
+        # as a code block, but the parser trimmed each line before matching, so
+        # this comment was itself a well-formed PASSING verdict, authored by an
+        # allowlisted identity and newer than the real review. Reporting a
+        # broken producer therefore turned into an auto-merge on the next run.
+        # No line below may begin with a contract keyword, and the self-marker
+        # is the last line so the parser skips the comment outright.
         body_file="${RUNNER_TEMP:-/tmp}/p6-adjudicator-unparseable.md"
         {
-          printf 'Autonomous adjudicator: unparseable verdict for lane(s) `%s`.\n\n' "$UNPARSEABLE_LANES"
+          printf 'Autonomous adjudicator: unparseable verdict for lane(s) "%s".\n\n' "$UNPARSEABLE_LANES"
           printf '%s\n\n' "$UNPARSEABLE_REPORT"
-          printf 'A review comment from an allowlisted author was found for the lane, but it did not carry the'
-          printf ' machine-readable verdict contract. The review must end with exactly these lines, unwrapped'
-          printf ' and unformatted:\n\n'
-          printf '    Review-Lane: %s\n' "$UNPARSEABLE_LANES"
-          printf '    Overall: patch is correct\n'
-          printf '    Findings (total): 0\n\n'
-          printf 'Verdict is `iterate`. This is reported rather than passed over in silence because a silent'
-          printf ' iterate consumes the whole fix loop. Producer: `p6m7g8-actions/claude`.\n'
+          printf 'A conversation comment from an allowlisted author was found for the lane, but it did not'
+          printf ' end with the machine-readable verdict block. The last three non-empty lines of the review'
+          printf ' must be, in this order and with nothing after them: a lane line naming the review lane,'
+          printf ' an overall line reading either that the patch is correct or that it is incorrect, and a'
+          printf ' findings-total line carrying an integer. The exact spelling is defined by the producer,'
+          printf ' p6m7g8-actions/claude. Emit them as plain text: no bold, no list marker, no code fence,'
+          printf ' no table, and no trailing footer.\n\n'
+          printf 'Verdict is "iterate". This is reported rather than passed over in silence because a silent'
+          printf ' iterate consumes the whole fix loop.\n'
+          printf '\n%s\n' "$SELF_MARKER"
         } > "$body_file"
         gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body_file"
 
@@ -347,9 +425,13 @@ runs:
         REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
         ITERATE_COMMENT: ${{ inputs.iterate_comment }}
+        SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
       run: |
         set -euo pipefail
-        gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$ITERATE_COMMENT"
+        # iterate_comment is caller-supplied, so the marker is appended here
+        # rather than trusted to be present in the input.
+        gh pr comment "$PR_NUMBER" --repo "$REPO" \
+          --body "$(printf '%s\n\n%s\n' "$ITERATE_COMMENT" "$SELF_MARKER")"
 
     - name: Resolve all unresolved review threads
       id: resolve
@@ -359,6 +441,7 @@ runs:
         GH_TOKEN: ${{ inputs.gh_token }}
         REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
+        SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
       run: |
         set -euo pipefail
         owner="${REPO%%/*}"
@@ -376,7 +459,8 @@ runs:
         done <<< "$threads"
 
         echo "count=$count" >> "$GITHUB_OUTPUT"
-        gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Autonomous adjudicator: resolved $count unresolved review thread(s)."
+        gh pr comment "$PR_NUMBER" --repo "$REPO" \
+          --body "$(printf 'Autonomous adjudicator: resolved %s unresolved review thread(s).\n\n%s\n' "$count" "$SELF_MARKER")"
 
     - name: Final guard
       id: final_guard
