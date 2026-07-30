@@ -31,9 +31,13 @@ inputs:
       Comma-delimited exact bot logins whose pull request CONVERSATION comments
       count as verdicts. Formal review bodies and inline review comments are not
       read at all, so an allowlisted identity that posts approving reviews rather
-      than conversation comments can never supply a verdict.
+      than conversation comments can never supply a verdict. Defaults to the
+      producer alone: github-actions[bot] is every workflow in the consuming
+      repository, so allowlisting it lets any of them mint an accept by ending a
+      comment with three short public lines. Add entries only for identities that
+      genuinely post review verdicts.
     required: false
-    default: "claude[bot],github-actions[bot],p6m7g8-automation"
+    default: "claude[bot]"
   iterate_comment:
     description: "Comment to post when verdict is iterate"
     required: false
@@ -72,6 +76,9 @@ outputs:
   unparseable_lanes:
     description: "Comma-delimited lanes whose verdict comment could not be parsed"
     value: ${{ steps.ai_run.outputs.unparseable_lanes || '' }}
+  findings_total:
+    description: "Sum of Findings (total) across every lane that reported a parseable verdict"
+    value: ${{ steps.ai_run.outputs.findings_total || '0' }}
   resolved_threads:
     description: "Count of resolved threads"
     value: ${{ steps.resolve.outputs.count || '0' }}
@@ -134,12 +141,20 @@ runs:
           exit 0
         fi
 
-        checks_json=$(gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/commits/$head_sha/check-runs?per_page=100")
+        # Paginated: a p6-build fleet puts well over 100 check runs on a SHA,
+        # and a truncated page makes a required check read as absent, which is
+        # a permanent proceed=false with nothing in the log to explain it.
+        checks_json=$(gh api --paginate -H "Accept: application/vnd.github+json" \
+          "/repos/$REPO/commits/$head_sha/check-runs?per_page=100" \
+          | jq -s '{ check_runs: (map(.check_runs) | add // []) }')
+
         IFS=',' read -r -a required <<< "$REQUIRED_CHECKS_CSV"
+        checks_seen=0
 
         for name in "${required[@]}"; do
           name="$(echo "$name" | sed 's/^ *//; s/ *$//')"
           [ -z "$name" ] && continue
+          checks_seen=$((checks_seen + 1))
           count=$(echo "$checks_json" | jq --arg n "$name" '[.check_runs[] | select(.name == $n)] | length')
           if [ "$count" -eq 0 ]; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
@@ -153,18 +168,50 @@ runs:
           fi
         done
 
-        # Freshness cutoff for verdict comments: the earliest moment any check
-        # run started on the head SHA, which is necessarily after the push that
-        # created it. A verdict comment about an earlier push was last written
-        # during that push's checks, so it cannot fall at or after this cutoff.
-        # This is what stops a stale pass from being read as a pass for new
-        # code. A green check on the head SHA does not imply a fresh comment:
-        # the distributed claude-review.yml runs the review with
-        # continue-on-error, so the check goes green even when the review
-        # produced nothing at all.
-        verdict_after=$(echo "$checks_json" | jq -r '[.check_runs[].started_at // empty] | sort | first // ""')
+        # An empty required_checks_csv would run the loop zero times and reach
+        # proceed=true having verified nothing. Same fail-open shape as the
+        # zero-lanes guard; refuse it the same way.
+        if [ "$checks_seen" -eq 0 ]; then
+          echo "::error title=Adjudicator misconfigured::required_checks_csv resolved to zero checks"
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Freshness cutoff for verdict comments. See the Freshness section of
+        # README.md for why this exists and what it defends against.
+        #
+        # The cutoff is the earliest check SUITE creation time on the head SHA.
+        # Suites are created in response to the push, so this lands just after
+        # it, and `created_at` is server-assigned, immutable, and not settable
+        # by the PR author the way a commit's committer date is.
+        #
+        # It must not move under re-runs. Check RUN started_at does move: a
+        # re-run updates the run in place, so "Re-run all jobs" after a flake
+        # would push the cutoff past a genuine fresh verdict and deadlock the PR
+        # at quiet iterate while it was otherwise green. Suite created_at does
+        # not move; a re-run either updates the existing suite's updated_at or
+        # adds a later suite, and taking the minimum ignores both.
+        #
+        # A commit's GraphQL pushedDate would be the natural answer and is what
+        # the review suggested, but that field is deprecated -- "no longer
+        # supported. Removal on 2023-07-01 UTC" -- and returns null for every
+        # commit, verified against this repository and against public ones.
+        suites_json=$(gh api --paginate -H "Accept: application/vnd.github+json" \
+          "/repos/$REPO/commits/$head_sha/check-suites?per_page=100" \
+          | jq -s '{ check_suites: (map(.check_suites) | add // []) }')
+        verdict_after=$(echo "$suites_json" | jq -r '[.check_suites[].created_at // empty] | sort | first // ""')
+
+        # Refuse rather than continue without a cutoff. Treating an empty value
+        # as "no filter" would let an unexpected API shape silently switch off
+        # the freshness guard, which is the fail-open this action keeps closing.
+        if [ -z "$verdict_after" ]; then
+          echo "::error title=Adjudicator cannot establish freshness::no check suite creation time on $head_sha"
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
 
         {
+          echo "head_sha=$head_sha"
           echo "verdict_after=$verdict_after"
           echo "proceed=true"
         } >> "$GITHUB_OUTPUT"
@@ -207,14 +254,22 @@ runs:
         # now that Codex is retired, so there is nothing to reconcile: every
         # required lane must say correct.
         #
-        # Matching is positional on those last three lines and never a scan of
-        # the whole body. Scanning was a fail-open: a review that merely QUOTES
-        # the contract while discussing it emitted a parseable verdict, and this
-        # action's own fail-loud comment used to reproduce the contract, so run
-        # N would report a broken producer and run N+1 would read its own
-        # comment back as a pass and auto-merge. Three independent guards now
-        # close that: positional matching, the self-marker below, and a loud
-        # comment that describes the lines instead of reproducing them.
+        # ACCEPTANCE is positional on those last three lines and is never a scan
+        # of the whole body. Scanning to accept was a fail-open: a review that
+        # merely QUOTES the contract while discussing it emitted a parseable
+        # verdict, and this action's own fail-loud comment used to reproduce the
+        # contract, so run N would report a broken producer and run N+1 would
+        # read its own comment back as a pass and auto-merge. Three independent
+        # guards close that: positional acceptance, the self-marker below, and a
+        # loud comment that describes the lines instead of reproducing them.
+        #
+        # The body IS scanned for one purpose that cannot fail open, because it
+        # only ever turns a rejection into a louder rejection: if no candidate
+        # carries the lane in its last three lines but some candidate names it
+        # anywhere in its body, the lane is unparseable rather than missing, so
+        # it takes the loud path. That is the likeliest real failure, since
+        # claude-code-action's own prompt appends a branch link at the bottom of
+        # the comment, which pushes a perfectly good contract out of the tail.
         #
         # Comments are read over REST, not `gh pr view --json comments`. The
         # GraphQL shape gh uses renders a GitHub App author with the "[bot]"
@@ -240,6 +295,7 @@ runs:
         def trim: gsub("^\\s+|\\s+$"; "");
         def clean: gsub("`"; "");
         def tail3: split("\n") | map(gsub("\r"; "") | trim) | map(select(length > 0)) | (["", "", ""] + .) | .[-3:];
+        def all_lines: split("\n") | map(gsub("\r"; "") | trim) | map(select(length > 0));
         def lanes_named: [ .[] | select(startswith("Review-Lane:")) | ltrimstr("Review-Lane:") | trim ];
         ($allowed | split(",") | map(trim) | map(select(length > 0))) as $logins
         | ($lanes | split(",") | map(trim) | map(select(length > 0))) as $required
@@ -248,13 +304,22 @@ runs:
             | select(((.body // "") | contains($marker)) | not)
             | { author: (.user.login // ""),
                 at: (.updated_at // .created_at // ""),
-                tail: ((.body // "") | tail3) }
-            | select(($after | length) == 0 or (.at >= $after))
+                tail: ((.body // "") | tail3),
+                body_lanes: ((.body // "") | all_lines | lanes_named) }
+            | select(.at >= $after)
           ] | sort_by(.at) as $candidates
         | $required[] as $lane
         | [ $candidates[] | select(.tail | lanes_named | index($lane)) ] as $attempts
         | if ($attempts | length) == 0
-          then [$lane, "missing", "", ""]
+          then
+            # Nothing carries the lane in its tail. If some candidate names the
+            # lane anywhere in its body, the producer emitted a contract that is
+            # not where it must be, so say so loudly instead of going quiet.
+            if [ $candidates[] | select(.body_lanes | index($lane)) ] | length > 0
+            then [$lane, "unparseable", "",
+                  "contract lines found in the body but not as the last three lines; nothing may follow them, including a trailing branch or job link"]
+            else [$lane, "missing", "", ""]
+            end
           else
             ($attempts | last) as $chosen
             | [ $candidates[]
@@ -289,6 +354,16 @@ runs:
           end
         | @tsv'
 
+        # The gate refuses to proceed without a cutoff, so this is belt to that
+        # brace. Left unchecked, an empty cutoff makes every `.at >= $after`
+        # string comparison true and silently disables the freshness filter.
+        if [ -z "$VERDICT_AFTER" ]; then
+          echo "::error title=Adjudicator refusing to parse::no freshness cutoff was established"
+          echo "verdict=iterate" >> "$GITHUB_OUTPUT"
+          echo "unparseable_lanes=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         records="$(jq -r \
           --arg allowed "$ALLOWED_BOT_LOGINS" \
           --arg lanes "$REQUIRED_LANES_CSV" \
@@ -300,6 +375,7 @@ runs:
         lanes_seen=0
         unparseable_lanes=""
         report=""
+        findings_total=0
 
         # Fields are split by hand rather than with `IFS=$'\t' read`. Tab is an
         # IFS whitespace character even when IFS is set to it alone, so `read`
@@ -316,10 +392,12 @@ runs:
           lanes_seen=$((lanes_seen + 1))
           case "$state" in
             correct)
+              findings_total=$((findings_total + findings))
               echo "adjudicator: lane '$lane' reports patch is correct, $findings finding(s)."
               ;;
             incorrect)
               accept="false"
+              findings_total=$((findings_total + findings))
               echo "adjudicator: lane '$lane' reports patch is incorrect, $findings finding(s)."
               ;;
             missing)
@@ -354,6 +432,7 @@ runs:
         {
           echo "verdict=$verdict"
           echo "unparseable_lanes=$unparseable_lanes"
+          echo "findings_total=$findings_total"
         } >> "$GITHUB_OUTPUT"
 
         if [ -n "$unparseable_lanes" ]; then
@@ -389,8 +468,23 @@ runs:
         UNPARSEABLE_LANES: ${{ steps.ai_run.outputs.unparseable_lanes }}
         UNPARSEABLE_REPORT: ${{ steps.ai_run.outputs.unparseable_report }}
         SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
+        HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
       run: |
         set -euo pipefail
+
+        # Dedup. This action fires on pull_request_target including `edited`,
+        # and on workflow_run completion of both Build and Claude Code Review,
+        # so one push with a broken producer used to draw several identical
+        # comments and every body edit added another. The key is scoped to the
+        # head SHA so a new push does report again.
+        dedup_key="<!-- p6-adjudicator-key: unparseable:$HEAD_SHA:$UNPARSEABLE_LANES -->"
+        existing="$(gh api --paginate -H "Accept: application/vnd.github+json" \
+          "/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+          | jq -s --arg k "$dedup_key" '[ (map(.) | add // [])[] | select((.body // "") | contains($k)) ] | length')"
+        if [ "$existing" -gt 0 ]; then
+          echo "adjudicator: unparseable verdict already reported for this head; not reposting."
+          exit 0
+        fi
 
         # This comment DESCRIBES the contract lines; it must never reproduce
         # them. An earlier version printed them indented four spaces to render
@@ -413,7 +507,7 @@ runs:
           printf ' no table, and no trailing footer.\n\n'
           printf 'Verdict is "iterate". This is reported rather than passed over in silence because a silent'
           printf ' iterate consumes the whole fix loop.\n'
-          printf '\n%s\n' "$SELF_MARKER"
+          printf '\n%s\n%s\n' "$SELF_MARKER" "$dedup_key"
         } > "$body_file"
         gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body_file"
 
@@ -426,12 +520,25 @@ runs:
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
         ITERATE_COMMENT: ${{ inputs.iterate_comment }}
         SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
+        HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
       run: |
         set -euo pipefail
+
+        # Same dedup as the fail-loud comment, and the same reason: several
+        # triggers per push each used to draw another identical comment.
+        dedup_key="<!-- p6-adjudicator-key: iterate:$HEAD_SHA -->"
+        existing="$(gh api --paginate -H "Accept: application/vnd.github+json" \
+          "/repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" \
+          | jq -s --arg k "$dedup_key" '[ (map(.) | add // [])[] | select((.body // "") | contains($k)) ] | length')"
+        if [ "$existing" -gt 0 ]; then
+          echo "adjudicator: iterate already reported for this head; not reposting."
+          exit 0
+        fi
+
         # iterate_comment is caller-supplied, so the marker is appended here
         # rather than trusted to be present in the input.
         gh pr comment "$PR_NUMBER" --repo "$REPO" \
-          --body "$(printf '%s\n\n%s\n' "$ITERATE_COMMENT" "$SELF_MARKER")"
+          --body "$(printf '%s\n\n%s\n%s\n' "$ITERATE_COMMENT" "$SELF_MARKER" "$dedup_key")"
 
     - name: Resolve all unresolved review threads
       id: resolve
@@ -488,10 +595,20 @@ runs:
         REPO: ${{ inputs.repo }}
         PR_NUMBER: ${{ steps.select_pr.outputs.pr_number }}
         REQUIRED_LANES_CSV: ${{ inputs.required_lanes_csv }}
+        FINDINGS_TOTAL: ${{ steps.ai_run.outputs.findings_total }}
+        SELF_MARKER: ${{ steps.consts.outputs.self_marker }}
       run: |
         set -euo pipefail
+        # Describes the outcome; it must not quote the contract. This body used
+        # to reproduce the positive Overall line verbatim, which is the one
+        # string this action goes out of its way never to write. It is inert
+        # while /pulls/{n}/reviews is unread, but widening the parse scope later
+        # would have turned an approval into a verdict. The self-marker is here
+        # for the same reason: so that if reviews ever are read, this is skipped
+        # like every other body the action posts.
         gh pr review "$PR_NUMBER" --repo "$REPO" --approve \
-          --body "Autonomous approval: every required Claude review lane ($REQUIRED_LANES_CSV) reported \`Overall: patch is correct\`."
+          --body "$(printf 'Autonomous approval: every required review lane (%s) returned a passing verdict, with %s finding(s) reported in total.\n\n%s\n' \
+            "$REQUIRED_LANES_CSV" "${FINDINGS_TOTAL:-0}" "$SELF_MARKER")"
 
     - name: Enqueue PR
       if: steps.ai_out.outputs.verdict == 'accept' && steps.final_guard.outputs.ok == 'true' && inputs.enqueue_on_accept == 'true'
