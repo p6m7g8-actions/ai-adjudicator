@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Adjudicate
-        uses: p6m7g8-actions/ai-adjudicator@main
+        uses: p6m7g8-actions/p6-gh-review-adjudicate@main
         with:
           gh_token: ${{ secrets.P6_A_GH_TOKEN }}
 ```
